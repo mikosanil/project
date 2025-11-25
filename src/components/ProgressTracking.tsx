@@ -27,6 +27,10 @@ export function ProgressTracking({ projectId }: ProgressTrackingProps) {
   const [sortBy, setSortBy] = useState('poz_code') // poz_code, progress, name
   const [showFilters, setShowFilters] = useState(false)
   const [activeTab, setActiveTab] = useState<'overview' | 'history'>('overview')
+  
+  // Pagination states
+  const [currentPage, setCurrentPage] = useState(1)
+  const [itemsPerPage] = useState(20) // Sayfa başına 20 item
 
   useEffect(() => {
     if (!authLoading && user) {
@@ -77,56 +81,71 @@ export function ProgressTracking({ projectId }: ProgressTrackingProps) {
     try {
       setLoading(true)
       
-      // Load assemblies with their stages
-      const { data: assembliesData, error: assembliesError } = await supabase
-        .from('assemblies')
-        .select(`
-          *,
-          project_stages (
-            id,
-            stage_name,
-            status
-          )
-        `)
-        .eq('project_id', projectId)
-        .order('poz_code')
+      // Paralel olarak tüm verileri yükle (daha hızlı)
+      const [assembliesResult, stagesResult] = await Promise.all([
+        // Assemblies'i basit şekilde yükle (JOIN'siz - daha hızlı)
+        supabase
+          .from('assemblies')
+          .select('*')
+          .eq('project_id', projectId)
+          .order('poz_code'),
+        
+        // Project stages'i ayrı yükle
+        supabase
+          .from('project_stages')
+          .select('*')
+          .eq('project_id', projectId)
+          .order('stage_order')
+      ])
 
-      if (assembliesError) throw assembliesError
+      if (assembliesResult.error) throw assembliesResult.error
+      if (stagesResult.error) throw stagesResult.error
 
-      // Load project stages (instead of work_stages)
-      const { data: stagesData, error: stagesError } = await supabase
-        .from('project_stages')
-        .select('*')
-        .eq('project_id', projectId)
-        .order('stage_order')
+      const assembliesData = assembliesResult.data || []
+      const stagesData = stagesResult.data || []
 
-      if (stagesError) throw stagesError
-
-      // Load progress entries
-      const assemblyIds = assembliesData?.map(a => a.id) || []
+      // Progress entries'i optimize edilmiş şekilde yükle
       let progressData: any[] = []
       
-      if (assemblyIds.length > 0) {
-        const { data, error: progressError } = await supabase
-          .from('progress_entries')
-          .select(`
-            *,
-            assemblies (poz_code, stage_id, project_stages (stage_name))
-          `)
-          .in('assembly_id', assemblyIds)
-          .order('completion_date', { ascending: false })
+      if (assembliesData.length > 0) {
+        const assemblyIds = assembliesData.map(a => a.id)
+        
+        // Daha büyük chunk size (100) - daha az HTTP isteği
+        const chunkSize = 100
+        const progressChunks: any[] = []
 
-        if (progressError) throw progressError
-        progressData = data || []
+        for (let i = 0; i < assemblyIds.length; i += chunkSize) {
+          const chunk = assemblyIds.slice(i, i + chunkSize)
+
+          try {
+            // Basit sorgu - JOIN'siz (daha hızlı)
+            const { data, error } = await supabase
+              .from('progress_entries')
+              .select('*')
+              .in('assembly_id', chunk)
+              .order('completion_date', { ascending: false })
+
+            if (error) {
+              console.error('Error loading progress entries chunk:', error)
+              continue // Hata durumunda devam et
+            }
+
+            progressChunks.push(...(data || []))
+          } catch (error) {
+            console.error('Unhandled error while loading progress entries chunk:', error)
+            continue // Hata durumunda devam et
+          }
+        }
+
+        progressData = progressChunks
       }
 
-      console.log('ProgressTracking - Assemblies loaded:', assembliesData?.length)
-      console.log('ProgressTracking - Stages loaded:', stagesData?.length)
+      console.log('ProgressTracking - Assemblies loaded:', assembliesData.length)
+      console.log('ProgressTracking - Stages loaded:', stagesData.length)
       console.log('ProgressTracking - Progress entries loaded:', progressData.length)
-      console.log('ProgressTracking - Sample progress entry:', progressData[0])
       
-      setAssemblies(assembliesData || [])
-      setWorkStages(stagesData || []) // Now using project_stages instead of work_stages
+      setAssemblies(assembliesData)
+      setWorkStages(stagesData)
       setProgressEntries(progressData)
     } catch (error) {
       console.error('Error loading data:', error)
@@ -269,11 +288,52 @@ export function ProgressTracking({ projectId }: ProgressTrackingProps) {
   }
 
   const filteredProgressEntries = getFilteredAndSortedProgressEntries()
+  
+  // Pagination logic for history tab
+  const totalItems = filteredProgressEntries.length
+  const totalPages = Math.ceil(totalItems / itemsPerPage)
+  const startIndex = (currentPage - 1) * itemsPerPage
+  const endIndex = startIndex + itemsPerPage
+  const paginatedEntries = filteredProgressEntries.slice(startIndex, endIndex)
+  
+  // Reset to first page when filters change
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [searchTerm, progressFilter, stageFilter, sortBy])
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full animate-spin" />
+      <div className="p-6">
+        {/* Skeleton Loading */}
+        <div className="animate-pulse">
+          {/* Header Skeleton */}
+          <div className="flex items-center justify-between mb-6">
+            <div className="h-8 bg-gray-200 rounded w-48"></div>
+            <div className="flex space-x-2">
+              <div className="h-10 bg-gray-200 rounded w-24"></div>
+              <div className="h-10 bg-gray-200 rounded w-24"></div>
+            </div>
+          </div>
+          
+          {/* Filters Skeleton */}
+          <div className="flex flex-wrap gap-4 mb-6">
+            <div className="h-10 bg-gray-200 rounded w-64"></div>
+            <div className="h-10 bg-gray-200 rounded w-32"></div>
+            <div className="h-10 bg-gray-200 rounded w-32"></div>
+          </div>
+          
+          {/* Grid Skeleton */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+            {[...Array(8)].map((_, i) => (
+              <div key={i} className="bg-white rounded-lg border border-gray-200 p-4">
+                <div className="h-4 bg-gray-200 rounded w-20 mb-2"></div>
+                <div className="h-6 bg-gray-200 rounded w-full mb-3"></div>
+                <div className="h-2 bg-gray-200 rounded w-full mb-2"></div>
+                <div className="h-4 bg-gray-200 rounded w-16"></div>
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
     )
   }
@@ -517,30 +577,47 @@ export function ProgressTracking({ projectId }: ProgressTrackingProps) {
                             style={{ width: `${overallProgress}%` }}
                           />
                         </div>
-                        <div className="flex flex-wrap gap-1 sm:gap-2">
-                          {(() => {
-                            const assemblyStage = assemblies.find(a => a.id === assembly.id)?.project_stages
-                            if (!assemblyStage) return null
-                            
-                            const isAssigned = assignedTasks.includes(assemblyStage.id)
-                            const progress = stageProgress[assemblyStage.id] || 0
-                            
-                            return (
-                              <div 
-                                className={`w-5 h-5 sm:w-6 sm:h-6 rounded-full flex items-center justify-center text-xs font-medium ${
-                                  !isAssigned ? 'opacity-50' : ''
-                                }`}
-                                style={{ 
-                                  backgroundColor: progress > 90 ? '#3B82F6' : '#3B82F620',
-                                  color: progress > 90 ? 'white' : '#3B82F6'
-                                }}
-                                title={`${assemblyStage.stage_name}: ${progress.toFixed(0)}%${!isAssigned ? ' (Atanmamış)' : ''}`}
-                              >
-                                {progress.toFixed(0)}
+                        {/* Aşama Bilgisi - Minimalist */}
+                        {(() => {
+                          const assemblyStage = workStages.find(stage => stage.id === assembly.stage_id)
+                          if (!assemblyStage) return null
+                          
+                          const isAssigned = assignedTasks.includes(assemblyStage.id)
+                          const progress = stageProgress[assemblyStage.id] || 0
+                          
+                          // Aşama renklerini belirle
+                          const getStageColor = (stageName: string) => {
+                            const colors = {
+                              'kesim': '#EF4444',    // Kırmızı
+                              'imalat': '#F59E0B',   // Turuncu
+                              'kaynak': '#3B82F6',   // Mavi
+                              'boya': '#10B981'      // Yeşil
+                            }
+                            return colors[stageName as keyof typeof colors] || '#6B7280'
+                          }
+                          
+                          const stageColor = getStageColor(assemblyStage.stage_name)
+                          
+                          return (
+                            <div className="flex items-center justify-between mt-2">
+                              <div className="flex items-center space-x-2">
+                                <div 
+                                  className="w-3 h-3 rounded-full flex-shrink-0"
+                                  style={{ backgroundColor: stageColor }}
+                                />
+                                <span 
+                                  className="text-xs font-medium"
+                                  style={{ color: stageColor }}
+                                >
+                                  {assemblyStage.stage_name.charAt(0).toUpperCase() + assemblyStage.stage_name.slice(1)}
+                                </span>
                               </div>
-                            )
-                          })()}
-                        </div>
+                              <span className="text-xs font-semibold text-gray-700">
+                                {progress.toFixed(0)}%
+                              </span>
+                            </div>
+                          )
+                        })()}
                       </div>
                     </div>
                   </div>
@@ -605,25 +682,43 @@ export function ProgressTracking({ projectId }: ProgressTrackingProps) {
 
                 <div className="space-y-2">
                   {(() => {
-                    const assemblyStage = assemblies.find(a => a.id === assembly.id)?.project_stages
+                    // Stage bilgisini assemblies'den al
+                    const assemblyStage = workStages.find(stage => stage.id === assembly.stage_id)
                     if (!assemblyStage) return null
                     
                     const isAssigned = assignedTasks.includes(assemblyStage.id)
                     const progress = stageProgress[assemblyStage.id] || 0
                     
+                    // Aşama renklerini belirle
+                    const getStageColor = (stageName: string) => {
+                      const colors = {
+                        'kesim': '#EF4444',    // Kırmızı
+                        'imalat': '#F59E0B',   // Turuncu
+                        'kaynak': '#3B82F6',   // Mavi
+                        'boya': '#10B981'      // Yeşil
+                      }
+                      return colors[stageName as keyof typeof colors] || '#6B7280'
+                    }
+                    
+                    const stageColor = getStageColor(assemblyStage.stage_name)
+                    
                     return (
-                      <div className="flex items-center justify-between text-xs sm:text-sm">
-                        <div className="flex items-center space-x-2 min-w-0 flex-1">
+                      <div className="flex items-center justify-between mt-2">
+                        <div className="flex items-center space-x-2">
                           <div 
-                            className="w-2 h-2 sm:w-3 sm:h-3 rounded-full flex-shrink-0"
-                            style={{ backgroundColor: '#3B82F6' }}
+                            className="w-3 h-3 rounded-full flex-shrink-0"
+                            style={{ backgroundColor: stageColor }}
                           />
-                          <span className={`text-gray-700 truncate ${!isAssigned ? 'opacity-50' : ''}`}>
-                            {assemblyStage.stage_name}
-                            {!isAssigned && ' (Atanmamış)'}
+                          <span 
+                            className="text-xs font-medium"
+                            style={{ color: stageColor }}
+                          >
+                            {assemblyStage.stage_name.charAt(0).toUpperCase() + assemblyStage.stage_name.slice(1)}
                           </span>
                         </div>
-                        <span className="font-medium flex-shrink-0 ml-2">{progress.toFixed(0)}%</span>
+                        <span className="text-xs font-semibold text-gray-700">
+                          {progress.toFixed(0)}%
+                        </span>
                       </div>
                     )
                   })()}
@@ -699,7 +794,7 @@ export function ProgressTracking({ projectId }: ProgressTrackingProps) {
               <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
                 <h3 className="text-base sm:text-lg font-semibold text-gray-900">İlerleme Geçmişi</h3>
                 <div className="text-xs sm:text-sm text-gray-600">
-                  {filteredProgressEntries.length} kayıt (toplam {progressEntries.length})
+                  {paginatedEntries.length} kayıt gösteriliyor (toplam {filteredProgressEntries.length})
                 </div>
               </div>
             </div>
@@ -720,7 +815,7 @@ export function ProgressTracking({ projectId }: ProgressTrackingProps) {
                   </p>
                 </div>
               ) : (
-                filteredProgressEntries.map((entry) => (
+                paginatedEntries.map((entry) => (
                   <div key={entry.id} className="p-4 sm:p-6 hover:bg-gray-50 transition-colors">
                     <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
                       <div className="flex items-start space-x-3 sm:space-x-4 flex-1">
@@ -778,6 +873,55 @@ export function ProgressTracking({ projectId }: ProgressTrackingProps) {
                 ))
               )}
             </div>
+            
+            {/* Pagination */}
+            {totalPages > 1 && (
+              <div className="p-4 border-t border-gray-200 bg-gray-50">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm text-gray-700">
+                    {startIndex + 1}-{Math.min(endIndex, totalItems)} arası, toplam {totalItems} kayıt
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <button
+                      onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
+                      disabled={currentPage === 1}
+                      className="px-3 py-1 text-sm border border-gray-300 rounded-md hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Önceki
+                    </button>
+                    
+                    <div className="flex items-center space-x-1">
+                      {[...Array(Math.min(5, totalPages))].map((_, i) => {
+                        const pageNum = Math.max(1, Math.min(totalPages - 4, currentPage - 2)) + i
+                        if (pageNum > totalPages) return null
+                        
+                        return (
+                          <button
+                            key={pageNum}
+                            onClick={() => setCurrentPage(pageNum)}
+                            className={`px-3 py-1 text-sm border rounded-md ${
+                              currentPage === pageNum
+                                ? 'bg-blue-600 text-white border-blue-600'
+                                : 'border-gray-300 hover:bg-gray-100'
+                            }`}
+                          >
+                            {pageNum}
+                          </button>
+                        )
+                      })}
+                    </div>
+                    
+                    <button
+                      onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
+                      disabled={currentPage === totalPages}
+                      className="px-3 py-1 text-sm border border-gray-300 rounded-md hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Sonraki
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
